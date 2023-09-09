@@ -37,12 +37,21 @@ func (r *Redsync) NewMutex(name string, options ...Option) *Mutex {
 		driftFactor:   0.01,
 		timeoutFactor: 0.05,
 		quorum:        len(r.pools)/2 + 1,
-		pools:         r.pools,
+		pools:         randomPools(r.pools),
 	}
 	for _, o := range options {
 		o.Apply(m)
 	}
 	return m
+}
+
+// randomPools shuffle redis pools.
+// when the redis pools are disordered, centralized access to redis is reduced in concurrent scenarios.
+func randomPools(pools []redis.Pool) []redis.Pool {
+	rand.Shuffle(len(pools), func(i, j int) {
+		pools[i], pools[j] = pools[j], pools[i]
+	})
+	return pools
 }
 
 // An Option configures a mutex.
