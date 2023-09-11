@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"strconv"
 	"time"
 
 	"github.com/go-redsync/redsync/v4/redis"
@@ -31,6 +32,8 @@ type Mutex struct {
 	until        time.Time
 	shuffle      bool
 	failFast     bool
+	clusterMode  bool
+	keyCount     int
 
 	pools []redis.Pool
 }
@@ -90,8 +93,8 @@ func (m *Mutex) LockContext(ctx context.Context) error {
 		n, err := func() (int, error) {
 			ctx, cancel := context.WithTimeout(ctx, time.Duration(int64(float64(m.expiry)*m.timeoutFactor)))
 			defer cancel()
-			return m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
-				return m.acquire(ctx, pool, value)
+			return m.actOnPoolsAsync(func(name string, pool redis.Pool) (bool, error) {
+				return m.acquire(ctx, name, pool, value)
 			})
 		}()
 
@@ -105,8 +108,8 @@ func (m *Mutex) LockContext(ctx context.Context) error {
 		func() (int, error) {
 			ctx, cancel := context.WithTimeout(ctx, time.Duration(int64(float64(m.expiry)*m.timeoutFactor)))
 			defer cancel()
-			return m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
-				return m.release(ctx, pool, value)
+			return m.actOnPoolsAsync(func(name string, pool redis.Pool) (bool, error) {
+				return m.release(ctx, name, pool, value)
 			})
 		}()
 		if i == m.tries-1 && err != nil {
@@ -124,8 +127,8 @@ func (m *Mutex) Unlock() (bool, error) {
 
 // UnlockContext unlocks m and returns the status of unlock.
 func (m *Mutex) UnlockContext(ctx context.Context) (bool, error) {
-	n, err := m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
-		return m.release(ctx, pool, m.value)
+	n, err := m.actOnPoolsAsync(func(name string, pool redis.Pool) (bool, error) {
+		return m.release(ctx, name, pool, m.value)
 	})
 	if n < m.quorum {
 		return false, err
@@ -141,8 +144,8 @@ func (m *Mutex) Extend() (bool, error) {
 // ExtendContext resets the mutex's expiry and returns the status of expiry extension.
 func (m *Mutex) ExtendContext(ctx context.Context) (bool, error) {
 	start := time.Now()
-	n, err := m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
-		return m.touch(ctx, pool, m.value, int(m.expiry/time.Millisecond))
+	n, err := m.actOnPoolsAsync(func(name string, pool redis.Pool) (bool, error) {
+		return m.touch(ctx, name, pool, m.value, int(m.expiry/time.Millisecond))
 	})
 	if n < m.quorum {
 		return false, err
@@ -171,13 +174,13 @@ func (m *Mutex) Valid() (bool, error) {
 //
 // Deprecated: Use Until instead. See https://github.com/go-redsync/redsync/issues/72.
 func (m *Mutex) ValidContext(ctx context.Context) (bool, error) {
-	n, err := m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
-		return m.valid(ctx, pool)
+	n, err := m.actOnPoolsAsync(func(name string, pool redis.Pool) (bool, error) {
+		return m.valid(ctx, name, pool)
 	})
 	return n >= m.quorum, err
 }
 
-func (m *Mutex) valid(ctx context.Context, pool redis.Pool) (bool, error) {
+func (m *Mutex) valid(ctx context.Context, name string, pool redis.Pool) (bool, error) {
 	if m.value == "" {
 		return false, nil
 	}
@@ -186,7 +189,7 @@ func (m *Mutex) valid(ctx context.Context, pool redis.Pool) (bool, error) {
 		return false, err
 	}
 	defer conn.Close()
-	reply, err := conn.Get(m.name)
+	reply, err := conn.Get(name)
 	if err != nil {
 		return false, err
 	}
@@ -202,13 +205,13 @@ func genValue() (string, error) {
 	return base64.StdEncoding.EncodeToString(b), nil
 }
 
-func (m *Mutex) acquire(ctx context.Context, pool redis.Pool, value string) (bool, error) {
+func (m *Mutex) acquire(ctx context.Context, name string, pool redis.Pool, value string) (bool, error) {
 	conn, err := pool.Get(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer conn.Close()
-	reply, err := conn.SetNX(m.name, value, m.expiry)
+	reply, err := conn.SetNX(name, value, m.expiry)
 	if err != nil {
 		return false, err
 	}
@@ -223,13 +226,13 @@ var deleteScript = redis.NewScript(1, `
 	end
 `)
 
-func (m *Mutex) release(ctx context.Context, pool redis.Pool, value string) (bool, error) {
+func (m *Mutex) release(ctx context.Context, name string, pool redis.Pool, value string) (bool, error) {
 	conn, err := pool.Get(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer conn.Close()
-	status, err := conn.Eval(deleteScript, m.name, value)
+	status, err := conn.Eval(deleteScript, name, value)
 	if err != nil {
 		return false, err
 	}
@@ -244,33 +247,48 @@ var touchScript = redis.NewScript(1, `
 	end
 `)
 
-func (m *Mutex) touch(ctx context.Context, pool redis.Pool, value string, expiry int) (bool, error) {
+func (m *Mutex) touch(ctx context.Context, name string, pool redis.Pool, value string, expiry int) (bool, error) {
 	conn, err := pool.Get(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer conn.Close()
-	status, err := conn.Eval(touchScript, m.name, value, expiry)
+	status, err := conn.Eval(touchScript, name, value, expiry)
 	if err != nil {
 		return false, err
 	}
 	return status != int64(0), nil
 }
 
-func (m *Mutex) actOnPoolsAsync(actFn func(redis.Pool) (bool, error)) (int, error) {
+func (m *Mutex) actOnPoolsAsync(actFn func(name string, pool redis.Pool) (bool, error)) (int, error) {
 	type result struct {
 		node     int
 		statusOK bool
 		err      error
 	}
 
-	ch := make(chan result, len(m.pools))
-	for node, pool := range m.pools {
-		go func(node int, pool redis.Pool) {
-			r := result{node: node}
-			r.statusOK, r.err = actFn(pool)
-			ch <- r
-		}(node, pool)
+	var ch chan result
+
+	if m.clusterMode && m.keyCount > 0 {
+		ch = make(chan result, m.keyCount)
+		for i := 0; i < m.keyCount; i++ {
+			name := m.name + "-" + strconv.Itoa(i)
+			i := i
+			go func() {
+				r := result{node: i}
+				r.statusOK, r.err = actFn(name, m.pools[0])
+				ch <- r
+			}()
+		}
+	} else {
+		ch = make(chan result, len(m.pools))
+		for node, pool := range m.pools {
+			go func(node int, pool redis.Pool) {
+				r := result{node: node}
+				r.statusOK, r.err = actFn(m.name, pool)
+				ch <- r
+			}(node, pool)
+		}
 	}
 
 	var (
